@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import uuid
 
+import openai
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from rich.console import Console
@@ -28,6 +30,16 @@ from common.schemas import (
 
 
 console = Console()
+# Gemini/OpenRouter occasionally answer 503 "high demand" / 429 — retry those with backoff.
+LLM_RETRY = dict(
+    stop_after_attempt=5,
+    exponential_jitter_params={"initial": 10, "max": 60},  # free-tier quota resets per minute
+    retry_if_exception_type=(openai.InternalServerError, openai.RateLimitError, openai.APIConnectionError),
+)
+# Let the checkpointer (de)serialize our Pydantic state types without warnings.
+SERDE = JsonPlusSerializer(allowed_msgpack_modules=[
+    ("common.schemas", "PRAnalysis"), ("common.schemas", "ReviewComment"),
+])
 
 
 def node_fetch_pr(state: ReviewState) -> dict:
@@ -40,10 +52,18 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm().with_structured_output(PRAnalysis).with_retry(**LLM_RETRY)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": (
+                "Senior reviewer. Structured output. Calibrate confidence honestly: "
+                f">= {AUTO_APPROVE_THRESHOLD:.2f} only for trivial/mechanical changes (typo, docs, "
+                f"dependency bump) with nothing to ask; {ESCALATE_THRESHOLD:.2f}-"
+                f"{AUTO_APPROVE_THRESHOLD - 0.01:.2f} for normal feature changes that look fine but "
+                "leave an open question a human should double-check (schema/data migration, "
+                f"backward compatibility); below {ESCALATE_THRESHOLD:.2f} for security-sensitive "
+                "code or multiple red flags."
+            )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -63,17 +83,17 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
     # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -133,8 +153,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver(serde=SERDE))
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +193,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))

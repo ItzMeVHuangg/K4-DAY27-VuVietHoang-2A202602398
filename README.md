@@ -138,6 +138,17 @@ cp .env.example .env && $EDITOR .env        # set OPENROUTER_API_KEY and GITHUB_
 
 The SQLite file `hitl_audit.db` is created on demand when exercise 4 runs.
 
+**Using Google Gemini instead of OpenRouter** (what this submission was run with). No code change — Gemini exposes an OpenAI-compatible endpoint, so only `.env` changes (the key still goes in `OPENROUTER_API_KEY`, the variable `common/llm.py` reads):
+
+```env
+OPENROUTER_API_KEY=<Gemini API key from https://aistudio.google.com/apikey>
+LLM_MODEL=gemini-3.7-flash
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+GITHUB_USER=<your GitHub username>   # written to audit_events.reviewer_id
+```
+
+The free tier allows ~5 requests/minute per model; LLM calls retry with backoff on 429/503, and a run that still fails can be continued from its checkpoint (`--thread <id>` in exercise 4, **Continue run** in the Streamlit UI).
+
 ## Demo PRs
 
 Two PRs are kept at the public repo **<https://github.com/VinUni-AI20k/PR-Demo>** for testing:
